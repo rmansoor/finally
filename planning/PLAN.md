@@ -79,6 +79,7 @@ The user runs a single Docker command (or a provided start script). A browser op
 | Single Docker container | Students run one command; no docker-compose for production, no service orchestration |
 | uv for Python | Fast, modern Python project management; reproducible lockfile; what students should learn |
 | Market orders only | Eliminates order book, limit order logic, partial fills — dramatically simpler portfolio math |
+| No streaming for LLM chat responses | Structured Outputs already require the full JSON payload before it can be parsed, so token-by-token streaming buys nothing. Cerebras inference returns in 1-3s — a loading indicator is enough; `/api/chat` is a plain request/response, not SSE |
 
 ---
 
@@ -88,7 +89,9 @@ The user runs a single Docker command (or a provided start script). A browser op
 finally/
 ├── frontend/                 # Next.js TypeScript project (static export)
 ├── backend/                  # FastAPI uv project (Python)
-│   └── db/                   # Schema definitions, seed data, migration logic
+│   └── app/
+│       ├── market/           # Market data (built) — simulator, Massive client, price cache, SSE
+│       └── db/                # Schema definitions, seed data, migration logic
 ├── planning/                 # Project-wide documentation for agents
 │   ├── PLAN.md               # This document
 │   └── ...                   # Additional agent reference docs
@@ -109,9 +112,9 @@ finally/
 ### Key Boundaries
 
 - **`frontend/`** is a self-contained Next.js project. It knows nothing about Python. It talks to the backend via `/api/*` endpoints and `/api/stream/*` SSE endpoints. Internal structure is up to the Frontend Engineer agent.
-- **`backend/`** is a self-contained uv project with its own `pyproject.toml`. It owns all server logic including database initialization, schema, seed data, API routes, SSE streaming, market data, and LLM integration. Internal structure is up to the Backend/Market Data agents.
-- **`backend/db/`** contains schema SQL definitions and seed logic. The backend lazily initializes the database on first request — creating tables and seeding default data if the SQLite file doesn't exist or is empty.
-- **`db/`** at the top level is the runtime volume mount point. The SQLite file (`db/finally.db`) is created here by the backend and persists across container restarts via Docker volume.
+- **`backend/`** is a self-contained uv project with its own `pyproject.toml`. It owns all server logic including database initialization, schema, seed data, API routes, SSE streaming, market data, and LLM integration. Internal structure is up to the Backend/Market Data agents, following the `backend/app/<module>/` convention already established by `backend/app/market/`.
+- **`backend/app/db/`** contains schema SQL definitions and seed logic. The backend lazily initializes the database on first request — creating tables and seeding default data if the SQLite file doesn't exist or is empty.
+- **`db/`** at the top level is the runtime volume mount point for the SQLite *data* file, distinct from `backend/app/db/` which holds schema/seed *code*. The SQLite file (`db/finally.db`) is created here by the backend and persists across container restarts via Docker volume.
 - **`planning/`** contains project-wide documentation, including this plan. All agents reference files here as the shared contract.
 - **`test/`** contains Playwright E2E tests and supporting infrastructure (e.g., `docker-compose.test.yml`). Unit tests live within `frontend/` and `backend/` respectively, following each framework's conventions.
 - **`scripts/`** contains start/stop scripts that wrap Docker commands.
@@ -225,7 +228,9 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 - `price` REAL
 - `executed_at` TEXT (ISO timestamp)
 
-**portfolio_snapshots** — Portfolio value over time (for P&L chart). Recorded every 30 seconds by a background task, and immediately after each trade execution.
+**Trade validation** (applies identically to manual trades via `POST /api/portfolio/trade` and LLM-issued trades in §9): `quantity` must be a finite number `> 0` (no zero, negative, or non-numeric quantities); no minimum size beyond that. Buys additionally require `cash_balance >= quantity * price`; sells require `position.quantity >= quantity`. Any violation fails the trade with an error — see §8 and §9.
+
+**portfolio_snapshots** — Portfolio value over time (for P&L chart). Recorded every 30 seconds by a background task, and immediately after each trade execution. No retention/pruning policy — table growth is unbounded but trivial at capstone/demo scale (single user, short-lived sessions), so this is a deliberate omission, not a gap.
 - `id` TEXT PRIMARY KEY (UUID)
 - `user_id` TEXT (default: `"default"`)
 - `total_value` REAL
@@ -257,20 +262,21 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/portfolio` | Current positions, cash balance, total value, unrealized P&L |
-| POST | `/api/portfolio/trade` | Execute a trade: `{ticker, quantity, side}` |
+| POST | `/api/portfolio/trade` | Execute a trade: `{ticker, quantity, side}`. Success → `{trade: {...}, portfolio: {...}}`. Validation failure (see §7 trade validation) → HTTP 400 with `{error: "insufficient cash" \| "insufficient shares" \| "invalid quantity"}` |
 | GET | `/api/portfolio/history` | Portfolio value snapshots over time (for P&L chart) |
 
 ### Watchlist
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/watchlist` | Current watchlist tickers with latest prices |
-| POST | `/api/watchlist` | Add a ticker: `{ticker}` |
-| DELETE | `/api/watchlist/{ticker}` | Remove a ticker |
+| POST | `/api/watchlist` | Add a ticker: `{ticker}`. Adding a ticker already on the watchlist is a no-op (200, not an error) |
+| DELETE | `/api/watchlist/{ticker}` | Remove a ticker. Removing a ticker not on the watchlist is a no-op (200, not an error) |
 
 ### Chat
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/api/chat` | Send a message, receive complete JSON response (message + executed actions) |
+| POST | `/api/chat` | Send a message, receive complete JSON response (message + executed actions). Single request/response — no streaming (see §9) |
+| GET | `/api/chat` | Full conversation history from `chat_messages`, used by the frontend to repopulate the chat panel on page load/refresh |
 
 ### System
 | Method | Path | Description |
@@ -315,8 +321,8 @@ The LLM is instructed to respond with JSON matching this schema:
 ```
 
 - `message` (required): The conversational text shown to the user
-- `trades` (optional): Array of trades to auto-execute. Each trade goes through the same validation as manual trades (sufficient cash for buys, sufficient shares for sells)
-- `watchlist_changes` (optional): Array of watchlist modifications
+- `trades` (optional): Array of trades to auto-execute. Each trade goes through the same validation as manual trades (§7 trade validation: `quantity > 0`, sufficient cash for buys, sufficient shares for sells)
+- `watchlist_changes` (optional): Array of watchlist modifications. Same no-op-on-duplicate semantics as the manual endpoints (§8): adding an already-watched ticker or removing an unwatched one is not an error
 
 ### Auto-Execution
 
@@ -339,7 +345,14 @@ The LLM should be prompted as "FinAlly, an AI trading assistant" with instructio
 
 ### LLM Mock Mode
 
-When `LLM_MOCK=true`, the backend returns deterministic mock responses instead of calling OpenRouter. This enables:
+When `LLM_MOCK=true`, the backend returns deterministic mock responses instead of calling OpenRouter, using simple rule-based matching against the incoming message (no LLM call, no randomness) so E2E tests can assert on exact outcomes:
+
+- Message matches `/buy\s+(\d+(\.\d+)?)\s+(?:shares?\s+of\s+)?([A-Z]+)/i` → mock returns a `trades` array with that `{ticker, side: "buy", quantity}` and a canned confirmation `message`
+- Message matches the equivalent `sell` pattern → same, with `side: "sell"`
+- Message matches `/add\s+([A-Z]+)/i` or `/remove\s+([A-Z]+)/i` → mock returns a `watchlist_changes` entry
+- Anything else → a fixed analysis-style `message` with no `trades`/`watchlist_changes`
+
+This gives E2E tests at least one deterministic path that exercises trade execution and one that exercises watchlist changes (per §12's "AI chat (mocked)" scenario), plus a safe default for everything else. This also enables:
 - Fast, free, reproducible E2E tests
 - Development without an API key
 - CI/CD pipelines
@@ -452,5 +465,5 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Buy shares: cash decreases, position appears, portfolio updates
 - Sell shares: cash increases, position updates or disappears
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
-- AI chat (mocked): send a message, receive a response, trade execution appears inline
-- SSE resilience: disconnect and verify reconnection
+- AI chat (mocked): send a message that matches a mock trade pattern (e.g. "buy 5 AAPL", see §9 LLM Mock Mode) and verify the trade executes and appears inline; send a message that matches a mock watchlist pattern and verify the watchlist updates
+- SSE resilience: `docker compose -f test/docker-compose.test.yml restart app` to force-drop the SSE connection at the network level, then assert the connection dot goes yellow/red and `EventSource`'s built-in retry brings it back to green with prices flowing again
